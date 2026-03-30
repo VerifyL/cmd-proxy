@@ -12,14 +12,29 @@ import subprocess
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-DEFAULT_SOCKET_PATH = '/run/cmd-proxy.sock'
+DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy.sock'
 DEFAULT_TIMEOUT = 10
 DEFAULT_BACKLOG = 128
 DEFAULT_WORKERS = 4
 
+# 内部默认白名单
+DEFAULT_COMMANDS = {
+    'mstpctl': {
+        'sudo': True,
+        'max_args': 10,
+        'arg_patterns': r'^[a-zA-Z0-9_.-]+$'
+    },
+    'health': {
+        'sudo': False,
+        'max_args': 0,
+        'arg_patterns': None,
+        'virtual': True
+    }
+}
+
 def parse_args():
     parser = argparse.ArgumentParser(description='Command Proxy Server')
-    parser.add_argument('-c', '--config', help='YAML config file')
+    parser.add_argument('-c', '--config', help='YAML config file (optional)')
     parser.add_argument('-s', '--socket', default=DEFAULT_SOCKET_PATH,
                         help='Unix socket path')
     parser.add_argument('-t', '--timeout', type=int, default=DEFAULT_TIMEOUT,
@@ -30,14 +45,18 @@ def parse_args():
     return parser.parse_args()
 
 def load_config(config_path):
+    """加载 YAML 配置文件，如果不存在或解析失败则返回 None"""
     if not config_path or not os.path.exists(config_path):
-        return {}
+        return None
     try:
         import yaml
         with open(config_path, 'r') as f:
             return yaml.safe_load(f) or {}
     except ImportError:
-        logging.error("PyYAML not installed, cannot load config file.")
+        logging.error("PyYAML not installed. Please install it: pip install pyyaml")
+        sys.exit(1)
+    except Exception as e:
+        logging.error(f"Failed to parse config file: {e}")
         sys.exit(1)
 
 def setup_logging(debug=False):
@@ -90,8 +109,9 @@ class CommandProxy:
     def execute_command(self, base_cmd, args, timeout):
         rule = self.allowed_cmds.get(base_cmd, {})
         if rule.get('virtual', False):
-            if base_cmd == 'ping':
-                return "pong", "", 0
+            # 健康检查命令
+            if base_cmd == 'health':
+                return "ok", "", 0
             else:
                 return "", f"Virtual command {base_cmd} not implemented", 1
 
@@ -206,23 +226,18 @@ def main():
     args = parse_args()
     logger = setup_logging(args.debug)
 
+    # 加载配置文件（可选）
     config = load_config(args.config)
-    allowed_cmds = config.get('commands', {})
-
-    if not allowed_cmds:
-        logger.warning("No commands defined in config, using default mstpctl rules")
-        allowed_cmds = {
-            'mstpctl': {
-                'sudo': True,
-                'max_args': 10,
-                'arg_patterns': r'^[a-zA-Z0-9_.-]+$'
-            },
-            'ping': {
-                'sudo': False,
-                'max_args': 0,
-                'virtual': True
-            }
-        }
+    if config and 'commands' in config:
+        allowed_cmds = config['commands']
+        logger.info(f"Loaded commands from config file: {args.config}")
+    else:
+        # 使用内部默认白名单
+        allowed_cmds = DEFAULT_COMMANDS.copy()
+        if args.config:
+            logger.warning(f"Config file {args.config} has no 'commands' section, using default whitelist")
+        else:
+            logger.info("No config file provided, using default whitelist")
 
     server = CommandProxy(
         socket_path=args.socket,
