@@ -1,0 +1,182 @@
+```markdown
+# cmd-proxy
+
+**cmd-proxy** 是一个轻量级 Unix Socket 代理服务，允许容器（或任何进程）安全地调用宿主机上的系统命令。服务端运行在宿主机，根据白名单执行命令；客户端通过 Python 库与代理通信。
+
+## 特性
+
+- 🔒 **安全**：命令白名单，参数个数和正则校验
+- 🚀 **高性能**：多线程并发，支持大量客户端
+- 🐳 **容器友好**：通过挂载 Unix Socket 与容器通信，无需特权
+- 📦 **纯 Python 库**：提供简洁的 `execute()` 和 `CommandProxyClient` API
+- 📝 **可配置**：YAML 配置文件，支持自定义命令规则
+
+## 安装
+
+### 宿主机安装（服务端）
+
+```bash
+pip install cmd-proxy
+```
+
+安装后获得服务端命令 `cmd-proxy-server`。
+
+### 容器内安装（客户端）
+
+在容器中安装相同的 Python 包（仅客户端库）：
+
+```bash
+pip install cmd-proxy
+```
+
+## 快速开始
+
+### 1. 启动服务端
+
+创建配置文件 `/etc/cmd-proxy/config.yaml`：
+
+```yaml
+commands:
+  mstpctl:
+    sudo: true
+    max_args: 10
+    arg_patterns: '^[a-zA-Z0-9_.-]+$'
+  ping:
+    sudo: false
+    max_args: 0
+    virtual: true
+```
+
+启动服务：
+
+```bash
+sudo cmd-proxy-server -c /etc/cmd-proxy/config.yaml
+```
+
+后台运行可使用 systemd（见下文）。
+
+### 2. 在容器内使用 Python 客户端
+
+```python
+from cmd_proxy.client import execute, CommandProxyError
+
+try:
+    # 调用 mstpctl showbridge Bridge
+    output = execute(['mstpctl', 'showbridge', 'Bridge'])
+    print(output)
+except CommandProxyError as e:
+    print(f"Error: {e}")
+```
+
+如需复用连接（例如在长期运行的进程中），可使用 `CommandProxyClient`：
+
+```python
+from cmd_proxy.client import CommandProxyClient
+
+client = CommandProxyClient()
+out1 = client.send(['mstpctl', 'showbridge', 'Bridge'])
+out2 = client.send(['mstpctl', 'showport', 'Bridge'])
+client.close()
+```
+
+### 3. 容器挂载 socket
+
+启动容器时需挂载宿主机 socket：
+
+```bash
+docker run -v /run/cmd-proxy.sock:/run/cmd-proxy.sock your-image
+```
+
+### 4. 测试连接
+
+在容器内执行以下 Python 代码测试：
+
+```python
+from cmd_proxy.client import execute
+print(execute(['ping']))
+```
+
+应输出 `pong`。
+
+## 配置详解
+
+配置文件格式（YAML）：
+
+```yaml
+commands:
+  <command_name>:
+    sudo: true/false          # 是否使用 sudo 执行
+    max_args: <number>        # 最大参数个数
+    arg_patterns: <regex>     # 可选，参数正则校验（字符串或列表）
+    virtual: true/false       # 标记为虚拟命令，不执行外部程序
+```
+
+示例：
+
+```yaml
+commands:
+  mstpctl:
+    sudo: true
+    max_args: 10
+    arg_patterns: '^[a-zA-Z0-9_.-]+$'
+  ip:
+    sudo: true
+    max_args: 5
+  ping:
+    sudo: false
+    max_args: 0
+    virtual: true
+```
+
+## 系统集成
+
+### 使用 systemd 管理服务
+
+创建 `/etc/systemd/system/cmd-proxy.service`：
+
+```ini
+[Unit]
+Description=Command Proxy Server
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/cmd-proxy-server -c /etc/cmd-proxy/config.yaml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+```
+
+启用并启动：
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable cmd-proxy
+sudo systemctl start cmd-proxy
+```
+
+## 开发与测试
+
+### 安装开发依赖
+
+```bash
+pip install -e .[dev]   # 如果定义了 dev 额外依赖
+```
+
+或手动安装 pytest：
+
+```bash
+pip install pytest
+```
+
+### 运行测试
+
+```bash
+pytest tests/
+```
+
+## 许可证
+
+MIT
+```
