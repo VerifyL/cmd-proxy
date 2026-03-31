@@ -12,7 +12,7 @@ import subprocess
 import re
 from concurrent.futures import ThreadPoolExecutor
 
-DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy.sock'
+DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
 DEFAULT_TIMEOUT = 10
 DEFAULT_BACKLOG = 128
 DEFAULT_WORKERS = 4
