@@ -84,7 +84,7 @@ client.close()
 启动容器时需挂载宿主机 socket：
 
 ```bash
-docker run -v /run/cmd-proxy.sock:/run/cmd-proxy.sock your-image
+docker run -v /run/cmd-proxy:/run/cmd-proxy your-image
 ```
 
 ### 4. 测试连接
