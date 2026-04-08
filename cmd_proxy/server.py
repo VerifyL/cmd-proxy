@@ -12,6 +12,7 @@ import subprocess
 import re
 from concurrent.futures import ThreadPoolExecutor
 
+# 默认路径改为带嵌套子目录（适配Docker共享）
 DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
 DEFAULT_TIMEOUT = 10
 DEFAULT_BACKLOG = 128
@@ -36,7 +37,7 @@ def parse_args():
     parser = argparse.ArgumentParser(description='Command Proxy Server')
     parser.add_argument('-c', '--config', help='YAML config file (optional)')
     parser.add_argument('-s', '--socket', default=DEFAULT_SOCKET_PATH,
-                        help='Unix socket path')
+                        help='Unix socket path (with subdirectory, e.g., /tmp/cmd-proxy/cmd-proxy.sock)')
     parser.add_argument('-t', '--timeout', type=int, default=DEFAULT_TIMEOUT,
                         help='Default command timeout (seconds)')
     parser.add_argument('-w', '--workers', type=int, default=DEFAULT_WORKERS,
@@ -107,6 +108,7 @@ class CommandProxy:
         return True
 
     def execute_command(self, base_cmd, args, timeout):
+        """执行命令（支持Shell语法：管道/重定向）"""
         rule = self.allowed_cmds.get(base_cmd, {})
         if rule.get('virtual', False):
             # 健康检查命令
@@ -116,16 +118,19 @@ class CommandProxy:
                 return "", f"Virtual command {base_cmd} not implemented", 1
 
         use_sudo = rule.get('sudo', True)
-        full_cmd = []
+        # 拼接完整命令字符串（支持管道/重定向等Shell语法）
+        full_cmd_str = ""
         if use_sudo:
-            full_cmd.append('sudo')
-        full_cmd.append(base_cmd)
-        full_cmd.extend(args)
+            full_cmd_str += "sudo "
+        # 拼接基础命令+参数为完整字符串（处理参数中的特殊字符）
+        full_cmd_str += base_cmd + " " + " ".join(args)
+        self.logger.debug(f"Executing (shell mode): {full_cmd_str}")
 
-        self.logger.debug(f"Executing: {' '.join(full_cmd)}")
         try:
+            # 启用shell=True支持管道/重定向，设置超时
             result = subprocess.run(
-                full_cmd,
+                full_cmd_str,
+                shell=True,  # 关键：开启Shell模式
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -133,7 +138,7 @@ class CommandProxy:
             )
             return result.stdout, result.stderr, result.returncode
         except subprocess.TimeoutExpired:
-            self.logger.error(f"Command timeout after {timeout}s: {base_cmd} {args}")
+            self.logger.error(f"Command timeout after {timeout}s: {full_cmd_str}")
             return "", f"Command timed out after {timeout} seconds", -1
         except Exception as e:
             self.logger.exception(f"Unexpected error executing {base_cmd}: {e}")
@@ -185,15 +190,51 @@ class CommandProxy:
             conn.close()
 
     def start(self):
-        if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
+        # 递归创建嵌套子目录（不管多少级子目录都能创建）
+        socket_dir = os.path.dirname(self.socket_path)
+        if socket_dir:
+            try:
+                # exist_ok=True：目录已存在时不报错；mode=0o775：Docker容器内可读写
+                os.makedirs(socket_dir, mode=0o775, exist_ok=True)
+                self.logger.info(f"Created/verified socket directory: {socket_dir} (mode: 0o775)")
+                # 确保目录权限生效（避免umask覆盖）
+                os.chmod(socket_dir, 0o775)
+            except Exception as e:
+                self.logger.error(f"Failed to create socket directory {socket_dir}: {e}")
+                sys.exit(1)
 
-        self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind(self.socket_path)
-        self.server_socket.listen(DEFAULT_BACKLOG)
-        os.chmod(self.socket_path, 0o600)
-        self.logger.info(f"Listening on {self.socket_path}")
+        # 清理残留socket文件
+        if os.path.exists(self.socket_path):
+            try:
+                os.unlink(self.socket_path)
+                self.logger.info(f"Removed existing socket file: {self.socket_path}")
+            except Exception as e:
+                self.logger.error(f"Failed to remove existing socket file: {e}")
+                sys.exit(1)
+
+        try:
+            self.server_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.server_socket.bind(self.socket_path)
+            self.server_socket.listen(DEFAULT_BACKLOG)
+            # Socket权限改为0o666（Docker容器内任意用户可读写）
+            os.chmod(self.socket_path, 0o666)
+            self.logger.info(f"Successfully started server, listening on {self.socket_path} (socket mode: 0o666)")
+        except PermissionError as e:
+            self.logger.error(f"Permission denied when binding socket: {e}\n"
+                              f"Solution: Run as root or set directory permission to 0o775 (chmod 775 {socket_dir})")
+            sys.exit(1)
+        except FileNotFoundError as e:
+            self.logger.error(f"Socket directory not found: {e}\n"
+                              f"Solution: Check if {socket_dir} exists (code should auto-create it)")
+            sys.exit(1)
+        except OSError as e:
+            self.logger.error(f"OS error when binding socket: {e}\n"
+                              f"Possible reasons: socket path too long / address in use / read-only filesystem")
+            sys.exit(1)
+        except Exception as e:
+            self.logger.error(f"Unexpected error starting server: {e}")
+            sys.exit(1)
 
         self.running = True
         self.executor = ThreadPoolExecutor(max_workers=self.workers)
@@ -215,11 +256,19 @@ class CommandProxy:
         self.logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
         if self.server_socket:
-            self.server_socket.close()
+            try:
+                self.server_socket.close()
+            except Exception as e:
+                self.logger.warning(f"Failed to close server socket: {e}")
         if self.executor:
             self.executor.shutdown(wait=True)
+        # 清理socket文件
         if os.path.exists(self.socket_path):
-            os.unlink(self.socket_path)
+            try:
+                os.unlink(self.socket_path)
+                self.logger.info(f"Removed socket file: {self.socket_path}")
+            except Exception as e:
+                self.logger.warning(f"Failed to remove socket file: {e}")
         sys.exit(0)
 
 def main():
