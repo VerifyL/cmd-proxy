@@ -11,6 +11,8 @@ import argparse
 import subprocess
 import re
 from concurrent.futures import ThreadPoolExecutor
+import shlex
+import time
 
 # 默认路径改为带嵌套子目录（适配Docker共享）
 DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
@@ -107,38 +109,62 @@ class CommandProxy:
                         return False
         return True
 
+
     def execute_command(self, base_cmd, args, timeout):
-        """执行命令（支持Shell语法：管道/重定向）"""
+        """执行命令，自动选择 shell 模式或列表模式"""
         rule = self.allowed_cmds.get(base_cmd, {})
         if rule.get('virtual', False):
-            # 健康检查命令
             if base_cmd == 'health':
                 return "ok", "", 0
             else:
                 return "", f"Virtual command {base_cmd} not implemented", 1
 
         use_sudo = rule.get('sudo', True)
-        # 拼接完整命令字符串（支持管道/重定向等Shell语法）
-        full_cmd_str = ""
-        if use_sudo:
-            full_cmd_str += "sudo "
-        # 拼接基础命令+参数为完整字符串（处理参数中的特殊字符）
-        full_cmd_str += base_cmd + " " + " ".join(args)
-        self.logger.debug(f"Executing (shell mode): {full_cmd_str}")
 
+        # 构建命令列表（不含 sudo，稍后根据模式决定是否添加）
+        cmd_list = [base_cmd] + args
+
+        # 检查是否需要 shell 模式（是否包含管道、重定向等特殊字符）
+        need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
+
+        start_time = time.time()
         try:
-            # 启用shell=True支持管道/重定向，设置超时
-            result = subprocess.run(
-                full_cmd_str,
-                shell=True,  # 关键：开启Shell模式
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False
-            )
+            if need_shell:
+                # Shell 模式：拼接命令字符串，并转义参数（防止注入，但白名单命令已安全）
+                # 对每个参数进行 shell 转义，避免特殊字符被错误解析
+                escaped_args = [shlex.quote(arg) for arg in cmd_list]
+                full_cmd_str = " ".join(escaped_args)
+                if use_sudo:
+                    full_cmd_str = "sudo " + full_cmd_str
+                self.logger.debug(f"Executing (shell mode): {full_cmd_str}")
+                result = subprocess.run(
+                    full_cmd_str,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False
+                )
+            else:
+                # 列表模式：直接传递列表，无 shell 解析
+                final_cmd = []
+                if use_sudo:
+                    final_cmd.append('sudo')
+                final_cmd.extend(cmd_list)
+                self.logger.debug(f"Executing (list mode): {final_cmd}")
+                result = subprocess.run(
+                    final_cmd,
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    check=False
+                )
+            elapsed = time.time() - start_time
+            self.logger.debug(f"Command completed in {elapsed:.3f}s, returncode={result.returncode}")
             return result.stdout, result.stderr, result.returncode
         except subprocess.TimeoutExpired:
-            self.logger.error(f"Command timeout after {timeout}s: {full_cmd_str}")
+            self.logger.error(f"Command timeout after {timeout}s: {base_cmd} {args}")
             return "", f"Command timed out after {timeout} seconds", -1
         except Exception as e:
             self.logger.exception(f"Unexpected error executing {base_cmd}: {e}")
