@@ -16,7 +16,7 @@ import time
 
 # 默认路径改为带嵌套子目录（适配Docker共享）
 DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
-DEFAULT_TIMEOUT = 10
+DEFAULT_TIMEOUT = 20
 DEFAULT_BACKLOG = 128
 DEFAULT_WORKERS = 4
 
