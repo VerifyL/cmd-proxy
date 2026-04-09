@@ -8,7 +8,7 @@ from typing import List, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
-DEFAULT_TIMEOUT = 10
+DEFAULT_TIMEOUT = 20
 
 class CommandProxyError(Exception):
     pass
