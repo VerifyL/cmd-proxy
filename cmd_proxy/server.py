@@ -216,17 +216,24 @@ class CommandProxy:
                     try:
                         conn.sendall(line.encode())
                     except (BrokenPipeError, socket.error):
-                        self.logger.warning("Client disconnected, stopping stream")
+                        self.logger.debug("Client disconnected, stopping stream")
                         proc.terminate()
                         break
                 proc.wait()
             finally:
                 timer.cancel()
-            conn.sendall(b"__END__\n")
+            try:
+                conn.sendall(b"__END__\n")
+            except (BrokenPipeError, socket.error):
+                # 客户端可能已断开，忽略
+                self.logger.debug("Client disconnected while sending END marker")
             self.logger.debug(f"Stream command finished with returncode {proc.returncode}")
         except Exception as e:
             self.logger.exception(f"Unexpected error streaming {base_cmd}: {e}")
-            conn.sendall(f"Internal error: {str(e)}\n__END__\n".encode())
+            try:
+                conn.sendall(f"Internal error: {str(e)}\n__END__\n".encode())
+            except:
+                pass
 
     def handle_connection(self, conn, addr):
         try:
@@ -255,7 +262,7 @@ class CommandProxy:
             base_cmd = req['args'][0]
             cmd_args = req['args'][1:]
             timeout = req.get('timeout', self.default_timeout)
-            stream = req.get('stream', False)   # 新增流式标志
+            stream = req.get('stream', False)
 
             if not self.is_command_allowed(base_cmd, cmd_args):
                 conn.sendall(b"Command not allowed")
@@ -275,6 +282,10 @@ class CommandProxy:
             except:
                 pass
         finally:
+            try:
+                conn.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
             conn.close()
 
     def start(self):
