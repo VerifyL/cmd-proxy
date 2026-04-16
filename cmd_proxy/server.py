@@ -13,6 +13,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 import shlex
 import time
+import threading
 
 DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
 DEFAULT_TIMEOUT = 20
