@@ -123,8 +123,14 @@ class CommandProxy:
         start_time = time.time()
         try:
             if need_shell:
-                escaped_args = [shlex.quote(arg) for arg in cmd_list]
-                full_cmd_str = " ".join(escaped_args)
+                shell_metachars = set('|&;<>')
+                escaped_parts = []
+                for arg in cmd_list:
+                    if len(arg) == 1 and arg in shell_metachars:
+                        escaped_parts.append(arg)
+                    else:
+                        escaped_parts.append(shlex.quote(arg))
+                full_cmd_str = " ".join(escaped_parts)
                 if use_sudo:
                     full_cmd_str = "sudo " + full_cmd_str
                 self.logger.debug(f"Executing (shell mode): {full_cmd_str}")
@@ -176,8 +182,14 @@ class CommandProxy:
 
         try:
             if need_shell:
-                escaped_args = [shlex.quote(arg) for arg in cmd_list]
-                full_cmd_str = " ".join(escaped_args)
+                shell_metachars = set('|&;<>')
+                escaped_parts = []
+                for arg in cmd_list:
+                    if len(arg) == 1 and arg in shell_metachars:
+                        escaped_parts.append(arg)
+                    else:
+                        escaped_parts.append(shlex.quote(arg))
+                full_cmd_str = " ".join(escaped_parts)
                 if use_sudo:
                     full_cmd_str = "sudo " + full_cmd_str
                 self.logger.debug(f"Stream executing (shell mode): {full_cmd_str}")
