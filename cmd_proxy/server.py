@@ -108,7 +108,6 @@ class CommandProxy:
         return True
 
     def execute_command(self, base_cmd, args, timeout):
-        """一次性执行命令，返回 (stdout, stderr, returncode)"""
         rule = self.allowed_cmds.get(base_cmd, {})
         if rule.get('virtual', False):
             if base_cmd == 'health':
@@ -119,6 +118,63 @@ class CommandProxy:
         use_sudo = rule.get('sudo', True)
         cmd_list = [base_cmd] + args
         need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
+
+        if base_cmd == 'config':
+            if 'reload' in args or 'reboot' in args:
+                action = 'reload' if 'reload' in args else 'reboot'
+                self.logger.warning(f"Destructive command 'config {action}' triggered. Running in background.")
+                
+                log_dir = "/var/log"
+                pid_file = f'{log_dir}/.config_{action}.pid'
+                if os.path.exists(pid_file):
+                    try:
+                        with open(pid_file, 'r') as f:
+                            old_pid = int(f.read().strip())
+                        os.kill(old_pid, 0)
+                        self.logger.warning(f"Another config {action} already running (PID {old_pid})")
+                        return f"Another config {action} is already in progress. Please wait.", "", 1
+                    except (ProcessLookupError, FileNotFoundError, ValueError):
+                        os.unlink(pid_file)
+
+                log_file = f"{log_dir}/config_{action}.log"
+
+                cmd_list = ['sudo', 'config'] + args
+                if '-y' not in cmd_list and '--yes' not in cmd_list:
+                    cmd_list.append('-y')
+                full_cmd = ' '.join(shlex.quote(part) for part in cmd_list)
+                full_cmd += f' > {log_file} 2>&1'
+
+                wrapper_cmd = f'echo $$ > {pid_file} && {full_cmd}; rm -f {pid_file}'
+                self.logger.debug(f"Background command: {wrapper_cmd}")
+
+                try:
+                    subprocess.Popen(
+                        wrapper_cmd,
+                        shell=True,
+                        start_new_session=True,
+                        stdin=subprocess.DEVNULL,
+                        stdout=None,
+                        stderr=None
+                    )
+                    if action == 'reboot':
+                        msg = "Config reboot triggered. System will reboot."
+                        self.logger.info(msg)
+                        return msg, "", 0
+
+                    if os.path.exists(pid_file):
+                        with open(pid_file, 'r') as f:
+                            try:
+                                pid = int(f.read().strip())
+                                os.kill(pid, 0)
+                                msg = f"Config reload triggered in background. Monitor log: {log_file}"
+                                self.logger.info(msg)
+                                return msg, "", 0
+                            except (ValueError, ProcessLookupError, OSError):
+                                pass
+                    return "", "Config reload failed to start", 1
+                except Exception as e:
+                    self.logger.exception(f"Failed to start config {action}")
+                    return "", f"Failed to start config {action}: {str(e)}", -1
 
         start_time = time.time()
         try:
@@ -180,6 +236,14 @@ class CommandProxy:
         cmd_list = [base_cmd] + args
         need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
 
+        if base_cmd == 'config':
+            if 'reload' in args or 'reboot' in args:
+                stdout, stderr, ret = self.execute_command(base_cmd, args, timeout)
+                output = stdout if stdout else stderr
+                conn.sendall(output.encode())
+                conn.sendall(b"__END__\n")
+                return
+            
         try:
             if need_shell:
                 shell_metachars = set('|&;<>')
