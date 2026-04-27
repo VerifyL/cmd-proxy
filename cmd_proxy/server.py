@@ -120,8 +120,8 @@ class CommandProxy:
         need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
 
         if base_cmd == 'config':
-            if 'reload' in args or 'reboot' in args:
-                action = 'reload' if 'reload' in args else 'reboot'
+            if 'reload' in args:
+                action = 'reload'
                 self.logger.warning(f"Destructive command 'config {action}' triggered. Running in background.")
                 
                 log_dir = "/var/log"
@@ -156,10 +156,6 @@ class CommandProxy:
                         stdout=None,
                         stderr=None
                     )
-                    if action == 'reboot':
-                        msg = "Config reboot triggered. System will reboot."
-                        self.logger.info(msg)
-                        return msg, "", 0
 
                     if os.path.exists(pid_file):
                         with open(pid_file, 'r') as f:
