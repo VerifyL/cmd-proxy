@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 import shlex
 import time
 import threading
+import pty
 
 DEFAULT_SOCKET_PATH = '/tmp/cmd-proxy/cmd-proxy.sock'
 DEFAULT_TIMEOUT = 20
@@ -115,111 +116,164 @@ class CommandProxy:
             else:
                 return "", f"Virtual command {base_cmd} not implemented", 1
 
+        # 特殊命令：config reload 保持原后台行为（不需要 PTY）
+        if base_cmd == 'config' and 'reload' in args:
+            # 原有后台执行逻辑保持不变
+            action = 'reload' 
+            self.logger.warning(f"Destructive command 'config {action}' triggered. Running in background.")
+            log_dir = "/var/log"
+            pid_file = f'{log_dir}/.config_{action}.pid'
+            if os.path.exists(pid_file):
+                try:
+                    with open(pid_file, 'r') as f:
+                        old_pid = int(f.read().strip())
+                    os.kill(old_pid, 0)
+                    self.logger.warning(f"Another config {action} already running (PID {old_pid})")
+                    return f"Another config {action} is already in progress. Please wait.", "", 1
+                except (ProcessLookupError, FileNotFoundError, ValueError):
+                    os.unlink(pid_file)
+
+            log_file = f"{log_dir}/config_{action}.log"
+            cmd_list = ['sudo', 'config'] + args
+            if '-y' not in cmd_list and '--yes' not in cmd_list:
+                cmd_list.append('-y')
+            full_cmd = ' '.join(shlex.quote(part) for part in cmd_list)
+            full_cmd += f' > {log_file} 2>&1'
+            wrapper_cmd = f'echo $$ > {pid_file} && {full_cmd}; rm -f {pid_file}'
+            self.logger.debug(f"Background command: {wrapper_cmd}")
+
+            try:
+                subprocess.Popen(
+                    wrapper_cmd,
+                    shell=True,
+                    start_new_session=True,
+                    stdin=subprocess.DEVNULL,
+                    stdout=None,
+                    stderr=None
+                )
+                if os.path.exists(pid_file):
+                    with open(pid_file, 'r') as f:
+                        try:
+                            pid = int(f.read().strip())
+                            os.kill(pid, 0)
+                            msg = f"Config reload triggered in background. Monitor log: {log_file}"
+                            self.logger.info(msg)
+                            return msg, "", 0
+                        except (ValueError, ProcessLookupError, OSError):
+                            pass
+                return "", "Config reload failed to start", 1
+            except Exception as e:
+                self.logger.exception(f"Failed to start config {action}")
+                return "", f"Failed to start config {action}: {str(e)}", -1
+
+        # 普通命令：使用 PTY 执行
         use_sudo = rule.get('sudo', True)
         cmd_list = [base_cmd] + args
         need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
 
-        if base_cmd == 'config':
-            if 'reload' in args:
-                action = 'reload'
-                self.logger.warning(f"Destructive command 'config {action}' triggered. Running in background.")
-                
-                log_dir = "/var/log"
-                pid_file = f'{log_dir}/.config_{action}.pid'
-                if os.path.exists(pid_file):
-                    try:
-                        with open(pid_file, 'r') as f:
-                            old_pid = int(f.read().strip())
-                        os.kill(old_pid, 0)
-                        self.logger.warning(f"Another config {action} already running (PID {old_pid})")
-                        return f"Another config {action} is already in progress. Please wait.", "", 1
-                    except (ProcessLookupError, FileNotFoundError, ValueError):
-                        os.unlink(pid_file)
+        # 构造最终命令字符串
+        if need_shell:
+            escaped_parts = []
+            for arg in cmd_list:
+                if len(arg) == 1 and arg in {'|', '&', ';', '<', '>'}:
+                    escaped_parts.append(arg)
+                else:
+                    escaped_parts.append(shlex.quote(arg))
+            full_cmd_str = " ".join(escaped_parts)
+        else:
+            full_cmd_str = " ".join(shlex.quote(arg) for arg in cmd_list)
 
-                log_file = f"{log_dir}/config_{action}.log"
+        if use_sudo:
+            full_cmd_str = "sudo " + full_cmd_str
 
-                cmd_list = ['sudo', 'config'] + args
-                if '-y' not in cmd_list and '--yes' not in cmd_list:
-                    cmd_list.append('-y')
-                full_cmd = ' '.join(shlex.quote(part) for part in cmd_list)
-                full_cmd += f' > {log_file} 2>&1'
-
-                wrapper_cmd = f'echo $$ > {pid_file} && {full_cmd}; rm -f {pid_file}'
-                self.logger.debug(f"Background command: {wrapper_cmd}")
-
-                try:
-                    subprocess.Popen(
-                        wrapper_cmd,
-                        shell=True,
-                        start_new_session=True,
-                        stdin=subprocess.DEVNULL,
-                        stdout=None,
-                        stderr=None
-                    )
-
-                    if os.path.exists(pid_file):
-                        with open(pid_file, 'r') as f:
-                            try:
-                                pid = int(f.read().strip())
-                                os.kill(pid, 0)
-                                msg = f"Config reload triggered in background. Monitor log: {log_file}"
-                                self.logger.info(msg)
-                                return msg, "", 0
-                            except (ValueError, ProcessLookupError, OSError):
-                                pass
-                    return "", "Config reload failed to start", 1
-                except Exception as e:
-                    self.logger.exception(f"Failed to start config {action}")
-                    return "", f"Failed to start config {action}: {str(e)}", -1
+        self.logger.debug(f"Executing (PTY mode): {full_cmd_str}")
 
         start_time = time.time()
+        master_fd = None
+        slave_fd = None
+        proc = None
+        timer = None
+        output_bytes = b''
+
         try:
-            if need_shell:
-                shell_metachars = set('|&;<>')
-                escaped_parts = []
-                for arg in cmd_list:
-                    if len(arg) == 1 and arg in shell_metachars:
-                        escaped_parts.append(arg)
-                    else:
-                        escaped_parts.append(shlex.quote(arg))
-                full_cmd_str = " ".join(escaped_parts)
-                if use_sudo:
-                    full_cmd_str = "sudo " + full_cmd_str
-                self.logger.debug(f"Executing (shell mode): {full_cmd_str}")
-                result = subprocess.run(
-                    full_cmd_str,
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False
-                )
-            else:
-                final_cmd = []
-                if use_sudo:
-                    final_cmd.append('sudo')
-                final_cmd.extend(cmd_list)
-                self.logger.debug(f"Executing (list mode): {final_cmd}")
-                result = subprocess.run(
-                    final_cmd,
-                    shell=False,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    check=False
-                )
+            master_fd, slave_fd = pty.openpty()
+            proc = subprocess.Popen(
+                full_cmd_str,
+                shell=True,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+                start_new_session=True,
+                text=False,
+            )
+            os.close(slave_fd)
+            slave_fd = None
+
+            # 设置超时定时器
+            def timeout_handler():
+                self.logger.warning(f"PTY command timeout after {timeout}s: {base_cmd} {args}")
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                if master_fd is not None:
+                    # 强制关闭读端，使 os.read 返回空
+                    os.close(master_fd)
+
+            timer = threading.Timer(timeout, timeout_handler)
+            timer.start()
+
+            # 读取所有输出
+            with os.fdopen(master_fd, 'rb', buffering=0) as reader:
+                # 这里不能直接 reader.read() 因为会阻塞到关闭，而超时或进程结束才会关闭。
+                # 使用循环逐块读取
+                while True:
+                    try:
+                        chunk = reader.read(4096)
+                        if not chunk:
+                            break
+                        output_bytes += chunk
+                    except OSError:
+                        # fd 可能被超时关闭
+                        break
+
+            # 等待进程正常结束（如果不等待，可能输出未完全刷新）
+            if proc and proc.poll() is None:
+                proc.wait(timeout=max(1, timeout - (time.time() - start_time)))
+
+            # 解码输出（忽略无法解码的字符）
+            try:
+                output_str = output_bytes.decode('utf-8', errors='replace')
+            except:
+                output_str = output_bytes.decode('latin-1', errors='replace')
+
             elapsed = time.time() - start_time
-            self.logger.debug(f"Command completed in {elapsed:.3f}s, returncode={result.returncode}")
-            return result.stdout, result.stderr, result.returncode
-        except subprocess.TimeoutExpired:
-            self.logger.error(f"Command timeout after {timeout}s: {base_cmd} {args}")
-            return "", f"Command timed out after {timeout} seconds", -1
+            self.logger.debug(f"Command completed in {elapsed:.3f}s, returncode={proc.returncode if proc else -1}")
+            return output_str, "", proc.returncode if proc else -1
+
         except Exception as e:
-            self.logger.exception(f"Unexpected error executing {base_cmd}: {e}")
-            return "", str(e), -1
+            self.logger.exception(f"PTY execution error: {e}")
+            return "", f"PTY execution error: {str(e)}", -1
+        finally:
+            if timer:
+                timer.cancel()
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            if slave_fd is not None:
+                try:
+                    os.close(slave_fd)
+                except OSError:
+                    pass
 
     def execute_command_stream(self, base_cmd, args, timeout, conn):
-        """流式执行命令，将输出逐行发送到 conn，最后发送结束标记"""
         rule = self.allowed_cmds.get(base_cmd, {})
         if rule.get('virtual', False):
             if base_cmd == 'health':
@@ -228,83 +282,115 @@ class CommandProxy:
                 conn.sendall(f"Virtual command {base_cmd} not implemented\n__END__\n".encode())
             return
 
+        # config reload/reboot 保持非流式后台行为（与原版一致）
+        if base_cmd == 'config' and 'reload' in args:
+            stdout, stderr, ret = self.execute_command(base_cmd, args, timeout)
+            output = stdout if stdout else stderr
+            conn.sendall(output.encode())
+            conn.sendall(b"__END__\n")
+            return
+
         use_sudo = rule.get('sudo', True)
         cmd_list = [base_cmd] + args
         need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
 
-        if base_cmd == 'config':
-            if 'reload' in args or 'reboot' in args:
-                stdout, stderr, ret = self.execute_command(base_cmd, args, timeout)
-                output = stdout if stdout else stderr
-                conn.sendall(output.encode())
-                conn.sendall(b"__END__\n")
-                return
-            
-        try:
-            if need_shell:
-                shell_metachars = set('|&;<>')
-                escaped_parts = []
-                for arg in cmd_list:
-                    if len(arg) == 1 and arg in shell_metachars:
-                        escaped_parts.append(arg)
-                    else:
-                        escaped_parts.append(shlex.quote(arg))
-                full_cmd_str = " ".join(escaped_parts)
-                if use_sudo:
-                    full_cmd_str = "sudo " + full_cmd_str
-                self.logger.debug(f"Stream executing (shell mode): {full_cmd_str}")
-                proc = subprocess.Popen(
-                    full_cmd_str,
-                    shell=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True
-                )
-            else:
-                final_cmd = []
-                if use_sudo:
-                    final_cmd.append('sudo')
-                final_cmd.extend(cmd_list)
-                self.logger.debug(f"Stream executing (list mode): {final_cmd}")
-                proc = subprocess.Popen(
-                    final_cmd,
-                    shell=False,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                    universal_newlines=True
-                )
+        # 构造最终命令字符串
+        if need_shell:
+            escaped_parts = []
+            for arg in cmd_list:
+                if len(arg) == 1 and arg in {'|', '&', ';', '<', '>'}:
+                    escaped_parts.append(arg)
+                else:
+                    escaped_parts.append(shlex.quote(arg))
+            full_cmd_str = " ".join(escaped_parts)
+        else:
+            full_cmd_str = " ".join(shlex.quote(arg) for arg in cmd_list)
 
-            # 设置超时控制（使用 timer）
-            timer = threading.Timer(timeout, proc.terminate)
+        if use_sudo:
+            full_cmd_str = "sudo " + full_cmd_str
+
+        self.logger.debug(f"Stream PTY executing: {full_cmd_str}")
+
+        start_time = time.time() 
+        master_fd = None
+        slave_fd = None
+        proc = None
+        timer = None
+
+        try:
+            master_fd, slave_fd = pty.openpty()
+            proc = subprocess.Popen(
+                full_cmd_str,
+                shell=True,
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+                start_new_session=True,
+                text=False,      # 我们使用 bytes 手动解码更可靠
+            )
+            os.close(slave_fd)   # 父进程不再需要写端
+            slave_fd = None
+
+            # 设置超时定时器
+            def timeout_handler():
+                self.logger.warning(f"PTY command timeout after {timeout}s: {base_cmd} {args}")
+                if proc and proc.poll() is None:
+                    proc.terminate()
+                if master_fd is not None:
+                    os.close(master_fd)  # 强制关闭读端，停止阻塞
+
+            timer = threading.Timer(timeout, timeout_handler)
             timer.start()
-            try:
-                for line in iter(proc.stdout.readline, ''):
+
+            # 读取输出（字节模式，按行分割）
+            with os.fdopen(master_fd, 'rb', buffering=0) as reader:
+                while True:
+                    try:
+                        line = reader.readline()
+                    except OSError:
+                        break   # fd 可能被超时关闭
                     if not line:
                         break
                     try:
-                        conn.sendall(line.encode())
+                        conn.sendall(line)   # line 已经是 bytes
                     except (BrokenPipeError, socket.error):
-                        self.logger.debug("Client disconnected, stopping stream")
-                        proc.terminate()
+                        self.logger.debug("Client disconnected, terminating PTY command")
+                        if proc and proc.poll() is None:
+                            proc.terminate()
                         break
-                proc.wait()
-            finally:
+
+            # 等待进程结束（剩余时间）
+            if proc and proc.poll() is None:
+                proc.wait(timeout=max(1, timeout - (time.time() - start_time)))
+        except Exception as e:
+            self.logger.exception(f"PTY execution error: {e}")
+            try:
+                conn.sendall(f"Internal PTY error: {str(e)}\n".encode())
+            except:
+                pass
+        finally:
+            if timer:
                 timer.cancel()
+            if proc and proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            if master_fd is not None:
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+            if slave_fd is not None:
+                try:
+                    os.close(slave_fd)
+                except OSError:
+                    pass
             try:
                 conn.sendall(b"__END__\n")
             except (BrokenPipeError, socket.error):
-                # 客户端可能已断开，忽略
-                self.logger.debug("Client disconnected while sending END marker")
-            self.logger.debug(f"Stream command finished with returncode {proc.returncode}")
-        except Exception as e:
-            self.logger.exception(f"Unexpected error streaming {base_cmd}: {e}")
-            try:
-                conn.sendall(f"Internal error: {str(e)}\n__END__\n".encode())
-            except:
                 pass
 
     def handle_connection(self, conn, addr):
