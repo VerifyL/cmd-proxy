@@ -108,6 +108,82 @@ class CommandProxy:
                         return False
         return True
 
+    def _run_docker_clish(self, clish_args, timeout, stream_callback=None):
+        """
+        执行 docker exec 调用 clish_start
+        clish_args: 原始参数列表，例如 ['-c', 'show running-configuration']
+        stream_callback: 如果提供，则流式输出；否则返回完整输出 (stdout, stderr, ret)
+        """
+        # 构建 docker 命令，显式传递环境变量到容器内
+        docker_cmd = [
+            "docker", "exec",
+            "-e", "TERM=dumb",
+            "-e", "PAGER=cat",
+            "-e", "LESS=cat",
+            "-e", "CLICOLOR=0",
+            "mgmt-framework",
+            "/usr/sbin/cli/clish_start",
+            "-t", "0"
+        ] + clish_args   # 直接附加原始参数（如 -c ...）
+
+        # 设置子进程环境（可选，影响 docker 命令本身）
+        env = os.environ.copy()
+        env.update({
+            "TERM": "dumb",
+            "PAGER": "cat",
+            "LESS": "cat",
+            "CLICOLOR": "0"
+        })
+
+        if stream_callback is None:
+            # 非流式模式
+            try:
+                proc = subprocess.Popen(
+                    docker_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env
+                )
+                stdout, stderr = proc.communicate(timeout=timeout)
+                ret = proc.returncode
+                if ret != 0:
+                    self.logger.warning(f"docker exec clish_start returned {ret}")
+                return stdout, stderr, ret
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                return stdout, f"Command timed out after {timeout}s", -1
+            except Exception as e:
+                self.logger.exception(f"docker exec error: {e}")
+                return "", f"docker exec error: {str(e)}", -1
+        else:
+            # 流式模式
+            try:
+                proc = subprocess.Popen(
+                    docker_cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    env=env,
+                    bufsize=1
+                )
+                for line in iter(proc.stdout.readline, ''):
+                    if not line:
+                        break
+                    line = line.replace('\r', '')
+                    stream_callback(line)
+                proc.wait(timeout=timeout)
+                if proc.returncode != 0:
+                    self.logger.warning(f"docker exec clish_start returned {proc.returncode}")
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                stream_callback("[Command timed out]\n")
+            except Exception as e:
+                self.logger.exception(f"docker exec error: {e}")
+                stream_callback(f"[Internal error: {e}]\n")
+            return None
+
     def execute_command(self, base_cmd, args, timeout):
         rule = self.allowed_cmds.get(base_cmd, {})
         if rule.get('virtual', False):
@@ -165,6 +241,10 @@ class CommandProxy:
             except Exception as e:
                 self.logger.exception(f"Failed to start config {action}")
                 return "", f"Failed to start config {action}: {str(e)}", -1
+
+        if base_cmd == 'sonic-cli':
+            self.logger.debug(f"Converting sonic-cli to direct docker exec (non-stream): {base_cmd} {args}")
+            return self._run_docker_clish(args, timeout, stream_callback=None)
 
         # 普通命令：使用 PTY 执行
         use_sudo = rule.get('sudo', True)
@@ -282,11 +362,12 @@ class CommandProxy:
                 conn.sendall(f"Virtual command {base_cmd} not implemented\n__END__\n".encode())
             return
 
-        # config reload/reboot 保持非流式后台行为（与原版一致）
-        if base_cmd == 'config' and 'reload' in args:
-            stdout, stderr, ret = self.execute_command(base_cmd, args, timeout)
-            output = stdout if stdout else stderr
-            conn.sendall(output.encode())
+        if base_cmd == 'sonic-cli':
+            self.logger.debug(f"Converting sonic-cli to direct docker exec (stream): {base_cmd} {args}")
+            # 定义一个回调，将输出发送到 conn
+            def send_line(line):
+                conn.sendall(line.encode())
+            self._run_docker_clish(args, timeout, stream_callback=send_line)
             conn.sendall(b"__END__\n")
             return
 
@@ -352,6 +433,13 @@ class CommandProxy:
                         break   # fd 可能被超时关闭
                     if not line:
                         break
+                    # ====================== ✅ 核心修复 ======================
+                # 去掉 PTY 自动加的 \r 和终端控制字符，防止客户端解析爆炸
+                    line = line.replace(b'\r', b'')  # 移除 \r
+                    if line.strip() == b'':         # 空行直接发，不处理
+                        conn.sendall(b'\n')
+                        continue
+                # =========================================================
                     try:
                         conn.sendall(line)   # line 已经是 bytes
                     except (BrokenPipeError, socket.error):
