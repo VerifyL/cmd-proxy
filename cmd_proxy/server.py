@@ -183,6 +183,132 @@ class CommandProxy:
                 self.logger.exception(f"docker exec error: {e}")
                 stream_callback(f"[Internal error: {e}]\n")
             return None
+    def _run_user_cli(self,args):
+        action = args[0] #action-add，del
+        username = args[1] #name
+        self.logger.info(f"Proxy handling user-manage: action='{action}', user='{username}'")
+
+        try:
+            if action == 'add':
+                if len(args) < 6:#['user-manage', '动作', '用户名', '密码哈希', '角色', 'idle','expiration']
+                    return "", "Missing required arguments for 'add' action (need: action, name, passwd, role, day)", 1
+                    
+                passwd_hash = args[2]
+                role = args[3] #admin or normal
+                idle_timeout = args[4] #idle
+                expiration_days = args[5] # expiration
+
+                res_check = subprocess.run(['id', username], capture_output=True)
+                user_exists = (res_check.returncode == 0)
+                priority_groups = "sudo,docker" if role == 'admin' else ""
+                if not user_exists:
+                    self.logger.info(f"User '{username}' not found. Executing useradd...")
+                    cmd = ['sudo', 'useradd', '-s', '/bin/bash', '-m', '-d', f'/home/{username}']
+                    if priority_groups:
+                        cmd += ['-G', priority_groups]
+                    if passwd_hash:
+                        cmd += ['-p', passwd_hash]
+                    cmd.append(username)
+
+                    res = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                    if res.returncode != 0:
+                        return "", f"useradd failed: {res.stderr}", res.returncode
+                    msg_prefix = f"System user '{username}' created successfully."
+                else:
+                    self.logger.info(f"User '{username}' already exists. Updating password and role...")
+                    cmd_mod = ['sudo', 'usermod', '-p', passwd_hash]
+                    if priority_groups:
+                        cmd_mod += ['-G', priority_groups]
+                    else:
+                        cmd_mod += ['-G', ''] # 彻底剥夺 normal 用户的系统特权组
+                    cmd_mod.append(username)
+
+                    res = subprocess.run(cmd_mod, capture_output=True, text=True, timeout=10)
+                    if res.returncode != 0:
+                        return "", f"usermod update failed: {res.stderr}", res.returncode
+                    msg_prefix = f"System user '{username}' updated successfully."
+
+                if idle_timeout and expiration_days and idle_timeout != "0" and idle_timeout != "" and idle_timeout.isdigit():
+                    subprocess.run(['sudo', 'chage', '-M', idle_timeout, username])
+                    if "-" in str(expiration_days):
+                            subprocess.run(['sudo', 'chage', '-E', str(expiration_days), username])
+                else:
+                    subprocess.run(['sudo', 'chage', '-M', '99999', username])
+                    subprocess.run(['sudo', 'chage', '-E', '-1', username])
+                return f"{msg_prefix} Ageing configured to {idle_timeout} days.", "", 0
+            elif action == 'del':#['user-manage', '动作', '用户名']
+                res = subprocess.run(['sudo', 'userdel', '-r', username], capture_output=True, text=True, timeout=10)
+                if res.returncode != 0:
+                    return "", f"userdel failed: {res.stderr}", res.returncode
+                return f"System user '{username}' deleted successfully.", "", 0
+            elif action == 'login-limit': #['user-manage', 'login-limit', '最大重试次数', '锁定时间(分钟)']
+                if len(args) < 3:
+                        return "", "Missing required arguments for 'login-limit' (need: action, max_retry, lock_time)", 1
+                max_retry = args[1]
+                lock_time_mins = args[2]
+                    
+                if not max_retry.isdigit() or not lock_time_mins.isdigit():
+                    return "", "Login limit parameters must be integers", 1
+                        
+                lock_time_secs = int(lock_time_mins) * 60 # 算出 PAM 模块需要的绝对秒数
+                pam_file = '/etc/pam.d/sshd'
+                sshd_file = '/etc/ssh/sshd_config'
+                subprocess.run(["sudo", "sed", "-i", "/pam_faillock.so/d", pam_file])
+                subprocess.run(["sudo", "sed", "-i", "/pam_unix.so/d", pam_file])
+                pam_configs = [
+                    f"auth        required           pam_faillock.so preauth audit deny={max_retry} unlock_time={lock_time_secs} even_deny_root",
+                    "auth        sufficient         pam_unix.so nullok try_first_pass",
+                    f"auth        [default=die]      pam_faillock.so authfail audit deny={max_retry} unlock_time={lock_time_secs} even_deny_root",
+                    "account     required           pam_faillock.so"
+                ]
+                # 将规则逆序打入首行
+                for line in reversed(pam_configs):
+                    escaped = line.replace("/", r"\/")
+                    subprocess.run(["sudo", "sed", "-i", f"1i\\{escaped}", pam_file])
+                        
+                    # 2. 修改系统的 SSHD 最大尝试上限次数
+                    subprocess.run(["sudo", "sed", "-i", f"/^\\(#\\)*MaxAuthTries/ s/^.*/MaxAuthTries {max_retry}/", sshd_file])
+                    
+                    # 3. 热重载系统 SSH 守护进程，使锁定策略即刻对全网登录生效
+                    subprocess.run(["sudo", "systemctl", "reload", "ssh"])
+                    
+                    self.logger.info(f"Successfully applied login limit: max_retry={max_retry}, lock_time={lock_time_mins}m")
+                    return f"Login failures limit configured to {max_retry} times, lock for {lock_time_mins} minutes.", "", 0
+            elif action == 'login-limit-default':
+                    pam_file = '/etc/pam.d/sshd'
+                    sshd_file = '/etc/ssh/sshd_config'
+                    
+                    # 1. 彻底清除通过代理注入的所有 pam_faillock 和被打乱的 pam_unix 规则
+                    subprocess.run(["sudo", "sed", "-i", "/pam_faillock.so/d", pam_file])
+                    subprocess.run(["sudo", "sed", "-i", "/pam_unix.so/d", pam_file])
+                    
+                    # 2. 还原回 Debian/SONiC 标准出厂的默认 SSHD PAM 认证堆栈
+                    # 标准出厂状态下，只需要一行标准的 pam_unix 即可（交由系统标准密码验证）
+                    default_pam_configs = [
+                        "auth        required           pam_env.so", # 有些版本自带，作为安全标准
+                        "auth        sufficient         pam_unix.so nullok try_first_pass",
+                        "account     required           pam_unix.so"
+                    ]
+                    # 逆序打回文件顶部，恢复纯净的出厂 PAM 认证生态
+                    for line in reversed(default_pam_configs):
+                        escaped = line.replace("/", r"\/")
+                        subprocess.run(["sudo", "sed", "-i", f"1i\\{escaped}", pam_file])
+                        
+                    # 3. 将 MaxAuthTries 恢复为系统默认状态（通常是出厂的注释状态，即系统默认的 6 次）
+                    # 将 MaxAuthTries 这一行恢复为标准的 #MaxAuthTries 注释
+                    subprocess.run(["sudo", "sed", "-i", "/^MaxAuthTries/ s/^.*/#MaxAuthTries 6/", sshd_file])
+                    
+                    # 4. 热重载 SSH 服务使恢复默认的策略立刻对全网生效
+                    subprocess.run(["sudo", "systemctl", "reload", "ssh"])
+                    
+                    self.logger.info("Successfully restored login-limit policy to system default.")
+                    return "Login attempts policy restored to system default (Disabled account lockout).", "", 0
+            else:
+                return "", f"Unsupported user-manage action: {action}", 1
+
+        except Exception as e:
+            self.logger.exception(f"Exception during user-manage execution: {e}")
+            return "", f"Internal proxy exception: {str(e)}", -1    
 
     def execute_command(self, base_cmd, args, timeout):
         rule = self.allowed_cmds.get(base_cmd, {})
@@ -245,6 +371,11 @@ class CommandProxy:
         if base_cmd == 'sonic-cli':
             self.logger.debug(f"Converting sonic-cli to direct docker exec (non-stream): {base_cmd} {args}")
             return self._run_docker_clish(args, timeout, stream_callback=None)
+        
+        
+        if base_cmd == 'user-manage':
+            return  self._run_user_cli(args)
+
 
         # 普通命令：使用 PTY 执行
         use_sudo = rule.get('sudo', True)
@@ -370,7 +501,9 @@ class CommandProxy:
             self._run_docker_clish(args, timeout, stream_callback=send_line)
             conn.sendall(b"__END__\n")
             return
-
+        if base_cmd == 'user-manage':
+            return  self._run_user_cli(args)
+        
         use_sudo = rule.get('sudo', True)
         cmd_list = [base_cmd] + args
         need_shell = any(c in '|&;<>' for arg in cmd_list for c in arg)
