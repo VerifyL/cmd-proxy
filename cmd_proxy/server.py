@@ -266,14 +266,14 @@ class CommandProxy:
                     escaped = line.replace("/", r"\/")
                     subprocess.run(["sudo", "sed", "-i", f"1i\\{escaped}", pam_file])
                         
-                    # 2. 修改系统的 SSHD 最大尝试上限次数
-                    subprocess.run(["sudo", "sed", "-i", f"/^\\(#\\)*MaxAuthTries/ s/^.*/MaxAuthTries {max_retry}/", sshd_file])
+                # 2. 修改系统的 SSHD 最大尝试上限次数
+                subprocess.run(["sudo", "sed", "-i", f"/^\\(#\\)*MaxAuthTries/ s/^.*/MaxAuthTries {max_retry}/", sshd_file])
                     
-                    # 3. 热重载系统 SSH 守护进程，使锁定策略即刻对全网登录生效
-                    subprocess.run(["sudo", "systemctl", "reload", "ssh"])
+                # 3. 热重载系统 SSH 守护进程，使锁定策略即刻对全网登录生效
+                subprocess.run(["sudo", "systemctl", "reload", "ssh"])
                     
-                    self.logger.info(f"Successfully applied login limit: max_retry={max_retry}, lock_time={lock_time_mins}m")
-                    return f"Login failures limit configured to {max_retry} times, lock for {lock_time_mins} minutes.", "", 0
+                self.logger.info(f"Successfully applied login limit: max_retry={max_retry}, lock_time={lock_time_mins}m")
+                return f"limit configured to {max_retry} times, lock for {lock_time_mins} minutes.", "", 0
             elif action == 'login-limit-default':
                     pam_file = '/etc/pam.d/sshd'
                     sshd_file = '/etc/ssh/sshd_config'
@@ -282,19 +282,7 @@ class CommandProxy:
                     subprocess.run(["sudo", "sed", "-i", "/pam_faillock.so/d", pam_file])
                     subprocess.run(["sudo", "sed", "-i", "/pam_unix.so/d", pam_file])
                     
-                    # 2. 还原回 Debian/SONiC 标准出厂的默认 SSHD PAM 认证堆栈
-                    # 标准出厂状态下，只需要一行标准的 pam_unix 即可（交由系统标准密码验证）
-                    default_pam_configs = [
-                        "auth        required           pam_env.so", # 有些版本自带，作为安全标准
-                        "auth        sufficient         pam_unix.so nullok try_first_pass",
-                        "account     required           pam_unix.so"
-                    ]
-                    # 逆序打回文件顶部，恢复纯净的出厂 PAM 认证生态
-                    for line in reversed(default_pam_configs):
-                        escaped = line.replace("/", r"\/")
-                        subprocess.run(["sudo", "sed", "-i", f"1i\\{escaped}", pam_file])
-                        
-                    # 3. 将 MaxAuthTries 恢复为系统默认状态（通常是出厂的注释状态，即系统默认的 6 次）
+                    # 2. 将 MaxAuthTries 恢复为系统默认状态（通常是出厂的注释状态，即系统默认的 6 次）
                     # 将 MaxAuthTries 这一行恢复为标准的 #MaxAuthTries 注释
                     subprocess.run(["sudo", "sed", "-i", "/^MaxAuthTries/ s/^.*/#MaxAuthTries 6/", sshd_file])
                     
