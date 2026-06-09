@@ -200,7 +200,7 @@ class CommandProxy:
 
                 res_check = subprocess.run(['id', username], capture_output=True)
                 user_exists = (res_check.returncode == 0)
-                priority_groups = "sudo,docker" if role == 'admin' else ""
+                priority_groups = "sudo,docker" #always sudo and docker
                 if not user_exists:
                     self.logger.info(f"User '{username}' not found. Executing useradd...")
                     cmd = ['sudo', 'useradd', '-s', '/bin/bash', '-m', '-d', f'/home/{username}']
@@ -216,17 +216,18 @@ class CommandProxy:
                     msg_prefix = f"System user '{username}' created successfully."
                 else:
                     self.logger.info(f"User '{username}' already exists. Updating password and role...")
-                    cmd_mod = ['sudo', 'usermod', '-p', passwd_hash]
-                    if priority_groups:
-                        cmd_mod += ['-G', priority_groups]
-                    else:
-                        cmd_mod += ['-G', ''] # 彻底剥夺 normal 用户的系统特权组
-                    cmd_mod.append(username)
+                    # cmd_mod = ['sudo', 'usermod', '-p', passwd_hash]
+                    # if priority_groups:
+                    #     cmd_mod += ['-G', priority_groups]
+                    # else:
+                    #     cmd_mod += ['-G', ''] # 彻底剥夺 normal 用户的系统特权组
+                    # cmd_mod.append(username)
 
-                    res = subprocess.run(cmd_mod, capture_output=True, text=True, timeout=10)
-                    if res.returncode != 0:
-                        return "", f"usermod update failed: {res.stderr}", res.returncode
-                    msg_prefix = f"System user '{username}' updated successfully."
+                    # res = subprocess.run(cmd_mod, capture_output=True, text=True, timeout=10)
+                    # if res.returncode != 0:
+                    #     return "", f"usermod update failed: {res.stderr}", res.returncode
+                    # msg_prefix = f"System user '{username}' updated successfully."
+                    return f"System user '{username}' already exists","",0
 
                 if idle_timeout and expiration_days and idle_timeout != "0" and idle_timeout != "" and idle_timeout.isdigit():
                     subprocess.run(['sudo', 'chage', '-M', idle_timeout, username])
